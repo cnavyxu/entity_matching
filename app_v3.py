@@ -19,6 +19,52 @@ import re
 
 logging.basicConfig(level=logging.INFO)
 
+NOISE_PATTERN = re.compile(r"[()\uff08\uff09\s]")
+CORP_SUFFIXES = [
+    "股份有限责任公司",
+    "集团有限责任公司",
+    "控股集团有限公司",
+    "集团股份有限公司",
+    "控股股份有限公司",
+    "有限责任公司",
+    "股份有限公司",
+    "控股有限公司",
+    "集团有限公司",
+    "控股公司",
+    "集团公司",
+    "股份公司",
+    "有限公司",
+    "集团",
+    "公司",
+]
+
+
+def sanitize_key(text: str) -> str:
+    if not text:
+        return ""
+    return NOISE_PATTERN.sub("", text)
+
+
+def remove_corporate_suffix(text: str) -> str:
+    if not text:
+        return ""
+    result = text
+    while True:
+        for suffix in CORP_SUFFIXES:
+            if result.endswith(suffix) and len(result) > len(suffix):
+                result = result[: -len(suffix)]
+                break
+        else:
+            break
+    return result
+
+
+def normalize_org_key(text: str) -> str:
+    sanitized = sanitize_key(text)
+    normalized = remove_corporate_suffix(sanitized)
+    return normalized or sanitized
+
+
 # ================= 基础配置 =================
 app = FastAPI(title="通用纠错接口", version="v1.0.0")
 
@@ -169,26 +215,47 @@ async def correct_one_string(
     t0 = time.perf_counter()
     # 1️⃣ 构建索引
     trans_items = [
-        TransItem(key=re.sub(r"[()\uff08\uff09\s]", "", item.key), value=item.value)
-        for item in trans_items
+        TransItem(key=sanitize_key(item.key), value=item.value) for item in trans_items
     ]
     trans_item_map = {item.key: item for item in trans_items}
     patterns = list(trans_item_map.keys())
 
+    # 标准化输入
+    need_clean = sanitize_key(need)
+
     # 2️⃣ 完全匹配快速返回
-    if need in patterns:
+    if need_clean in patterns:
         logging.info(f"待检测字符串:{need}=>符合完全匹配逻辑")
-        return trans_item_map[need]
+        return trans_item_map[need_clean]
 
     logging.info(f"待检测字符串:{need}=>不符合完全匹配逻辑")
+
     # 3️⃣ 编辑距离筛选 top-k 候选
+    normalized_need = normalize_org_key(need)
+    if not normalized_need:
+        normalized_need = need_clean
+
+    contains_financial_keyword = bool(
+        re.search(r"(银行|保险|证券|基金|信托|期货|租赁|担保)", need_clean)
+    )
+    scorer = fuzz.partial_ratio if contains_financial_keyword else fuzz.ratio
+
     filter_patterns = process.extract(
-        need,
+        normalized_need,
         patterns,
-        scorer=fuzz.ratio if not re.search(r"银行", need) else fuzz.partial_ratio,
+        scorer=scorer,
+        processor=remove_corporate_suffix,
         limit=top_k,
         score_cutoff=int(top_p * 100),
     )
+
+    # 调试信息：输出top 5候选及其得分
+    if filter_patterns:
+        top_candidates = filter_patterns[:5]
+        logging.info(f"Top 5 候选项及得分:")
+        for pattern, score, _ in top_candidates:
+            logging.info(f"  - {pattern}: {score:.2f}")
+
     candidates_patterns = [x[0] for x in filter_patterns]
 
     if not candidates_patterns:
