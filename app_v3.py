@@ -7,7 +7,7 @@
 
 from fastapi import FastAPI
 from pydantic import BaseModel, RootModel
-from typing import List
+from typing import List, Optional
 import httpx
 import numpy as np
 import asyncio
@@ -18,6 +18,18 @@ import time
 import re
 
 logging.basicConfig(level=logging.INFO)
+
+# 组织名称规范化配置
+COMMON_ORG_SUFFIXES = [
+    "股份有限公司",
+    "有限责任公司",
+    "集团有限责任公司",
+    "集团有限公司",
+    "有限公司",
+    "股份公司",
+    "有限合伙",
+]
+REMOVE_CHAR_PATTERN = re.compile(r"[()\uff08\uff09\s·•．.]+")
 
 # ================= 基础配置 =================
 app = FastAPI(title="通用纠错接口", version="v1.0.0")
@@ -63,6 +75,39 @@ class ErrorCorrectionResponse(BaseModel):
 
 
 # ================== 工具函数 ==================
+
+
+def normalize_org_name(name: Optional[str]) -> str:
+    """去除括号、空白以及尾部的通用公司后缀，提取组织名称核心部分"""
+    if not name:
+        return ""
+    normalized = REMOVE_CHAR_PATTERN.sub("", str(name).strip())
+    if not normalized:
+        return ""
+
+    # 迭代剥离常见的公司后缀（例如“股份有限公司”、“有限责任公司”等）
+    # 只要仍有匹配就持续移除，可以覆盖“集团有限公司”等复合后缀
+    while True:
+        stripped = False
+        for suffix in COMMON_ORG_SUFFIXES:
+            if normalized.endswith(suffix) and len(normalized) > len(suffix):
+                normalized = normalized[: -len(suffix)]
+                stripped = True
+                break
+        if not stripped:
+            break
+    return normalized
+
+
+def build_match_key(text: Optional[str]) -> str:
+    """生成用于匹配的key，优先返回规范化结果，若为空则退回简单清洗后的字符串"""
+    normalized = normalize_org_name(text)
+    if normalized:
+        return normalized
+    if not text:
+        return ""
+    fallback = REMOVE_CHAR_PATTERN.sub("", str(text).strip())
+    return fallback
 
 
 def edit_distance_ratio(a: str, b: str) -> float:
@@ -167,25 +212,37 @@ async def correct_one_string(
     """
 
     t0 = time.perf_counter()
-    # 1️⃣ 构建索引
-    trans_items = [
-        TransItem(key=re.sub(r"[()\uff08\uff09\s]", "", item.key), value=item.value)
-        for item in trans_items
-    ]
-    trans_item_map = {item.key: item for item in trans_items}
+    # 1️⃣ 构建索引（保留原始TransItem用于返回，仅对匹配key做规范化）
+    trans_item_map: dict[str, TransItem] = {}
+    for item in trans_items:
+        match_key = build_match_key(item.key)
+        if not match_key:
+            continue
+        trans_item_map.setdefault(match_key, item)
     patterns = list(trans_item_map.keys())
 
+    if not patterns:
+        logging.warning(f"待检测字符串:{need}=>候选列表为空，直接返回默认值")
+        return trans_items[0] if trans_items else TransItem(key="", value="")
+
+    need_key = build_match_key(need)
+    query = need_key or (need.strip() if need else "")
+
     # 2️⃣ 完全匹配快速返回
-    if need in patterns:
+    if need_key and need_key in trans_item_map:
         logging.info(f"待检测字符串:{need}=>符合完全匹配逻辑")
-        return trans_item_map[need]
+        return trans_item_map[need_key]
+
+    if not query:
+        logging.info(f"待检测字符串:{need}=>规范化后为空，返回默认值")
+        return trans_items[0] if trans_items else TransItem(key="", value="")
 
     logging.info(f"待检测字符串:{need}=>不符合完全匹配逻辑")
     # 3️⃣ 编辑距离筛选 top-k 候选
     filter_patterns = process.extract(
-        need,
+        query,
         patterns,
-        scorer=fuzz.ratio if not re.search(r"银行", need) else fuzz.partial_ratio,
+        scorer=fuzz.ratio if not re.search(r"银行", need or "") else fuzz.partial_ratio,
         limit=top_k,
         score_cutoff=int(top_p * 100),
     )
